@@ -35,7 +35,108 @@
 
 ## Установка
 
-### Локально (venv)
+### Рекомендуемый способ: автоматический установщик `install.py`
+
+Скрипт `install.py` полностью автоматизирует развёртывание на Linux:
+проверяет зависимости, создаёт системного пользователя, клонирует репозиторий,
+настраивает venv, генерирует `config.json` и systemd-юнит, запускает сервис.
+
+**Требуется root.** Запустите:
+
+```bash
+sudo python3 install.py
+```
+
+Скрипт задаст несколько вопросов (адрес TS6-сервера, порт ServerQuery, логин
+и пароль query-аккаунта, `sid`, `cid` AFK-канала и т.д.). Для большинства
+параметров есть значения по умолчанию — просто нажмите Enter, чтобы принять их.
+
+#### Неинтерактивная установка
+
+Если нужно развернуть бота без вопросов (например, в скрипте автоматизации),
+передайте все параметры флагами:
+
+```bash
+sudo python3 install.py --non-interactive \
+  --host ts.example.com \
+  --query-port 10022 \
+  --username bot \
+  --password 'SuperSecret' \
+  --virtual-server-id 1 \
+  --afk-channel-id 12 \
+  --timeout-seconds 300 \
+  --check-interval 30 \
+  --reconnect-delay 10 \
+  --poke-message 'Вы были перемещены в канал AFK из-за неактивности.' \
+  --exclude-uids 'uid1,uid2' \
+  --exclude-channels '5,7'
+```
+
+#### Все флаги `install.py`
+
+**Параметры бота** (иначе спросит интерактивно):
+
+| Флаг | Описание |
+|------|----------|
+| `--host` | Адрес TS6-сервера |
+| `--query-port` | Порт SSH ServerQuery (по умолчанию `10022`) |
+| `--username` | Логин query-аккаунта |
+| `--password` | Пароль query-аккаунта (сохраняется в `/etc/ts6-afk-bot/env`) |
+| `--virtual-server-id` | ID виртуального сервера (`sid`) |
+| `--afk-channel-id` | ID AFK-канала (`cid`) |
+| `--timeout-seconds` | Порог простоя в секундах (по умолчанию `300`) |
+| `--check-interval` | Период опроса в секундах (по умолчанию `30`) |
+| `--reconnect-delay` | Пауза перед переподключением в секундах (по умолчанию `10`) |
+| `--poke-message` | Текст poke-сообщения (пусто — не отправлять) |
+| `--exclude-uids` | UID через запятую, которых не трогать |
+| `--exclude-channels` | `cid` каналов через запятую, где не трогать |
+
+**Параметры установки:**
+
+| Флаг | Описание |
+|------|----------|
+| `--source` | URL или локальный путь к исходникам вместо GitHub |
+| `--install-dir` | Каталог установки (по умолчанию `/opt/ts6-afk-bot`) |
+| `--user` | Системный пользователь (по умолчанию `ts6afkbot`) |
+| `--service-name` | Имя systemd-юнита (по умолчанию `ts6-afk-bot`) |
+| `--skip-update` | Не обновлять исходники, если они уже есть |
+| `--no-service` | Установить без создания systemd-юнита |
+| `--bot-verbose` | Запускать бота с флагом `--verbose` |
+| `--non-interactive` (`--yes`) | Не задавать вопросов (все значения должны быть в флагах) |
+
+**Удаление:**
+
+| Флаг | Описание |
+|------|----------|
+| `--uninstall` | Удалить бота и сервис |
+| `--purge` | Вместе с `--uninstall`: удалить также все данные и пользователя |
+
+#### Что именно делает `install.py`
+
+1. Проверяет права root, наличие Python 3.10+, модуля `venv` и `git`.
+2. Устанавливает системные зависимости через `apt`, `dnf`, `yum`, `pacman` или `zypper`.
+3. Создаёт изолированного системного пользователя `ts6afkbot` (без shell).
+4. Клонирует репозиторий в `/opt/ts6-afk-bot` (или копирует локальные исходники через `--source`).
+5. Создаёт venv в `/opt/ts6-afk-bot/venv` и устанавливает `paramiko ≥ 3.4`.
+6. Собирает `config.json` и сохраняет его в `/etc/ts6-afk-bot/config.json` (chmod 640).
+7. Пароль ServerQuery кладёт в `/etc/ts6-afk-bot/env` как `TS6_QUERY_PASSWORD` (chmod 600), а не в JSON.
+8. Генерирует hardened systemd-юнит `/etc/systemd/system/ts6-afk-bot.service`, включает и запускает сервис.
+
+#### Где что лежит после установки
+
+```
+/opt/ts6-afk-bot/                 код + venv
+/etc/ts6-afk-bot/config.json      настройки (chmod 640)
+/etc/ts6-afk-bot/env              TS6_QUERY_PASSWORD (chmod 600)
+/var/lib/ts6-afk-bot/             HOME сервисного пользователя
+/etc/systemd/system/ts6-afk-bot.service
+```
+
+---
+
+### Ручная установка (venv)
+
+Если вы предпочитаете установить бота вручную:
 
 ```bash
 git clone https://github.com/Rednelss/ts6-afk-bot.git
@@ -47,29 +148,31 @@ source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Запуск как systemd-сервис (Linux)
+### Запуск как systemd-сервис (ручной)
 
 1. Скопируйте бота в `/opt/ts6-afk-bot`, создайте venv, установите зависимости.
 2. Скопируйте unit:
 
-```
-sudo cp ts6-afk-bot.service /etc/systemd/system/ts6-afk-bot.service
-```
+   ```bash
+   sudo cp ts6-afk-bot.service /etc/systemd/system/ts6-afk-bot.service
+   ```
+
 3. Откройте unit и при необходимости поправьте `User`, `WorkingDirectory`
-и `ExecStart`.
+   и `ExecStart`.
 4. Запустите:
 
-```
-sudo systemctl daemon-reload
-sudo systemctl enable --now ts6-afk-bot
-sudo journalctl -u ts6-afk-bot -f
-```
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now ts6-afk-bot
+   sudo journalctl -u ts6-afk-bot -f
+   ```
 
 ---
 
 ## Настройка
 
-Скопируйте пример и отредактируйте:
+При автоматической установке `config.json` создаётся в `/etc/ts6-afk-bot/config.json`.
+При ручной установке скопируйте пример:
 
 ```bash
 cp config.example.json config.json
@@ -80,7 +183,7 @@ cp config.example.json config.json
 | `host` | string | — | Адрес TS6-сервера |
 | `query_port` | int | — | Порт SSH ServerQuery (обычно `10022`) |
 | `username` | string | — | Логин query-аккаунта |
-| `password` | string | — | Пароль query-аккаунта |
+| `password` | string | — | Пароль query-аккаунта (при автоматической установке не используется — см. ниже) |
 | `virtual_server_id` | int | — | `sid` виртуального сервера (обычно `1`) |
 | `afk_channel_id` | int | — | `cid` AFK-канала |
 | `timeout_seconds` | int | `300` | Порог простоя в секундах |
@@ -91,7 +194,9 @@ cp config.example.json config.json
 | `exclude_channels` | int[] | `[]` | `cid` каналов, где не трогать |
 
 > **Пароль через переменную окружения.** Если задать `TS6_QUERY_PASSWORD`,
-> она переопределит `password` из JSON. Удобно для Docker/CI.
+> она переопределит `password` из JSON. Автоматический установщик использует
+> именно этот способ: пароль сохраняется в `/etc/ts6-afk-bot/env`, а в
+> `config.json` остаётся пустая строка.
 
 **Как узнать `virtual_server_id` и `afk_channel_id`:**
 
@@ -118,6 +223,33 @@ python bot.py --config config.json
 
 ```bash
 python bot.py --config config.json --verbose
+```
+
+При автоматической установке бот запускается как systemd-сервис и стартует
+автоматически при загрузке системы.
+
+---
+
+## Управление сервисом (systemd)
+
+```bash
+systemctl status ts6-afk-bot
+systemctl restart ts6-afk-bot
+journalctl -u ts6-afk-bot -f
+```
+
+---
+
+## Удаление
+
+Автоматический установщик умеет удалять бота:
+
+```bash
+# Остановить и убрать юнит, файлы оставить
+sudo python3 install.py --uninstall
+
+# Снести всё, включая данные и системного пользователя
+sudo python3 install.py --uninstall --purge
 ```
 
 ---
@@ -168,6 +300,16 @@ ServerQuery-шелле.
 ### `clientmove … error id=516` (нет прав)
 
 У query-аккаунта нет `b_client_move_power`. Выдайте права через ServerQuery.
+
+### `systemctl` не найден
+
+Если вы запускаете установщик в контейнере или WSL, systemd может
+отсутствовать. В этом случае используйте флаг `--no-service` — установщик
+настроит всё, но не будет создавать юнит. Бота можно запустить вручную:
+
+```bash
+sudo -u ts6afkbot /opt/ts6-afk-bot/venv/bin/python /opt/ts6-afk-bot/bot.py --config /etc/ts6-afk-bot/config.json
+```
 
 ---
 
