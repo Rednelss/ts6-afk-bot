@@ -7,11 +7,15 @@ TS6 AFK Bot
 неактивных пользователей в AFK-канал.
 
 Как это работает:
-  1. Бот подключается к ServerQuery TeamSpeak 6 через SSH (порт по умолчанию 10022).
-  2. Каждые N секунд он запрашивает список клиентов на виртуальном сервере.
-  3. Для каждого клиента читает client_idle_time (мс без активности).
-  4. Если время простоя превышает заданный порог (по умолчанию 300 сек = 5 мин),
-     бот перемещает клиента в AFK-канал и (опционально) отправляет poke-сообщение.
+  1. Бот подключается к ServerQuery TeamSpeak 6 через SSH (порт 10022).
+  2. Каждые N секунд запрашивает список клиентов одной командой
+     (clientlist -uid -times) — без N+1 запросов на каждого юзера.
+  3. Читает client_idle_time (мс без активности).
+  4. Если простой > порога — перемещает в AFK и (опционально) шлёт poke.
+
+Остановка:
+  Первый Ctrl+C — мягкая остановка (в течение ~0.5 сек).
+  Второй Ctrl+C — жёсткий выход немедленно.
 
 Требования:
   - Python 3.10+
@@ -21,6 +25,9 @@ TS6 AFK Bot
 
 Запуск:
   python bot.py --config config.json
+
+Переменные окружения:
+  TS6_QUERY_PASSWORD — если задана, переопределяет password из config.json.
 """
 
 from __future__ import annotations
@@ -28,9 +35,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -52,23 +61,44 @@ logging.basicConfig(
 log = logging.getLogger("ts6-afk-bot")
 
 # --------------------------------------------------------------------------- #
+#  Внутренний сигнал остановки
+# --------------------------------------------------------------------------- #
+
+class StopRequested(Exception):
+    """Выбрасывается внутри I/O-циклов, когда пришёл сигнал остановки."""
+
+# --------------------------------------------------------------------------- #
 #  Хелперы для ServerQuery
 # --------------------------------------------------------------------------- #
 
 # ANSI escape-последовательности, которые возвращает SSH-шелл (TTY).
-# Пример: \x1b[29G \x1b[J \x1b[46G
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_ANSI_RE = re.compile(
+    r"\x1b(?:"
+    r"\[[0-9;?]*[A-Za-z]"     # CSI
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC (BEL или ST)
+    r"|[()][0-9A-Za-z]"       # charset select
+    r"|[=>MNOP]"              # одиночные escape
+    r")"
+)
 
 # Приглашение ServerQuery:  nick@server(id):channel>
 _PROMPT_RE = re.compile(r"^\S+@\S+\(\d+\):\S+>\s*$")
 
+# Управляющие символы, которые ломают формат лога одной строкой.
+_CONTROL_RE = re.compile(r"[\r\n\t]+")
+
 def unescape(value: str) -> str:
-    """Раскодировать экранированные символы ServerQuery."""
+    """
+    Раскодировать экранированные символы ServerQuery.
+
+    Порядок замен критичен: сначала разворачиваем двойной бэкслеш,
+    иначе последующие replace('\\p', '|') сожрут его хвост.
+    """
     return (
-        value.replace("\\p", "|")
+        value.replace("\\\\", "\\")
+        .replace("\\p", "|")
         .replace("\\/", "/")
         .replace("\\s", " ")
-        .replace("\\\\", "\\")
         .replace("\\n", "\n")
         .replace("\\r", "\r")
         .replace("\\t", "\t")
@@ -85,34 +115,37 @@ def escape(value: str) -> str:
         .replace("\n", "\\n")
         .replace("\r", "\\r")
         .replace("\t", "\\t")
+        .replace("\v", "\\v")
     )
+
+def sanitize_for_log(value: str, limit: int = 64) -> str:
+    """Убрать ANSI/переводы строк из пользовательских данных для лога."""
+    clean = _ANSI_RE.sub("", value)
+    clean = _CONTROL_RE.sub(" ", clean).strip()
+    if len(clean) > limit:
+        clean = clean[: limit - 1] + "…"
+    return clean
 
 def parse_response(raw: str, echo: str = "") -> list[dict[str, str]]:
     """
     Разобрать ответ ServerQuery в список словарей.
 
-    Реальный формат ответа через invoke_shell():
+    Формат ответа через invoke_shell():
 
-        <эхо команды с ANSI-последовательностями>\r\n
-        <данные, записи через '|', поля через ' '>\r\n
-        error id=... msg=...\r\n
+        <эхо команды с ANSI>\\r\\n
+        <данные, записи через '|', поля через ' '>\\r\\n
+        error id=... msg=...\\r\\n
         <приглашение>
 
-    Что делаем:
-      * вырезаем ANSI-последовательности;
-      * отбрасываем строку-эхо (она начинается с отправленной команды);
-      * отбрасываем приглашение;
-      * проверяем error id.
-
-    Параметр echo — команда, которую мы только что отправили. Нужен, чтобы
-    надёжно отличить эхо от данных (эхо может содержать '=', например
-    'clientinfo clid=1', и без этого фильтра попадает в результат).
+    Строку-эхо убираем точным сравнением (clean == echo), а не по индексу —
+    это устойчиво к тому, что буфер мог начать читаться с середины ответа.
     """
     entries: list[dict[str, str]] = []
+    echo_norm = echo.strip()
 
     lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
-    for idx, raw_line in enumerate(lines):
+    for raw_line in lines:
         clean = _ANSI_RE.sub("", raw_line).strip()
         if not clean:
             continue
@@ -121,8 +154,8 @@ def parse_response(raw: str, echo: str = "") -> list[dict[str, str]]:
         if _PROMPT_RE.match(clean):
             continue
 
-        # Эхо отправленной команды — оно всегда идёт первой строкой
-        if idx == 0 and echo and clean.startswith(echo):
+        # Эхо отправленной команды — точное совпадение
+        if echo_norm and clean == echo_norm:
             continue
 
         # Строка ошибки
@@ -160,6 +193,7 @@ class TS6Query:
         port: int,
         username: str,
         password: str,
+        stop_evt: Optional[threading.Event] = None,
         connect_timeout: int = 15,
     ) -> None:
         self.host = host
@@ -167,8 +201,15 @@ class TS6Query:
         self.username = username
         self.password = password
         self.connect_timeout = connect_timeout
+        self._stop_evt = stop_evt
         self._ssh: Optional[paramiko.SSHClient] = None
         self._shell = None
+
+    # -- проверка остановки ------------------------------------------------- #
+
+    def _check_stop(self) -> None:
+        if self._stop_evt is not None and self._stop_evt.is_set():
+            raise StopRequested()
 
     # -- соединение --------------------------------------------------------- #
 
@@ -195,9 +236,9 @@ class TS6Query:
             raise RuntimeError(f"Ошибка SSH при подключении: {exc}") from exc
 
         self._ssh = ssh
-        self._shell = ssh.invoke_shell()
-        # Считываем приветственный баннер
-        self._read_all(wait=0.8)
+        self._shell = ssh.invoke_shell(term="xterm", width=512, height=512)
+        # Считываем приветственный баннер (там нет error id=).
+        self._drain(duration=0.8)
         log.info("Соединение с ServerQuery установлено.")
 
     def close(self) -> None:
@@ -216,33 +257,57 @@ class TS6Query:
 
     # -- чтение / запись ---------------------------------------------------- #
 
-    def _read_all(self, wait: float = 0.5) -> str:
-        """
-        Считывает всё, что успело прийти от сервера за указанное окно.
-
-        ServerQuery не присылает явных маркеров конца ответа, поэтому
-        мы используем небольшие паузы тишины.
-        """
+    def _drain(self, duration: float = 0.5) -> str:
+        """Прочитать всё, что успеет прийти за окно тишины (для баннера)."""
         assert self._shell is not None
         buf = ""
-        deadline = time.time() + wait
-        while time.time() < deadline:
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            self._check_stop()
             if self._shell.recv_ready():
                 buf += self._shell.recv(65535).decode("utf-8", errors="replace")
-                deadline = time.time() + 0.2  # продлеваем окно, пока есть данные
+                deadline = time.monotonic() + 0.1
             else:
-                time.sleep(0.05)
+                time.sleep(0.02)
         return buf
 
-    def send(self, command: str, wait: float = 0.5) -> str:
+    def _read_until_error(self, timeout: float = 5.0) -> str:
+        assert self._shell is not None
+        buf = b""  # байты, не строка
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            self._check_stop()
+            if self._shell.recv_ready():
+                buf += self._shell.recv(65535)
+                # ищем маркер в байтах — он ASCII, декодировать не нужно
+                if b"error id=" in buf:
+                    quiet_until = time.monotonic() + 0.1
+                    while time.monotonic() < quiet_until:
+                        self._check_stop()
+                        if self._shell.recv_ready():
+                            buf += self._shell.recv(65535)
+                            quiet_until = time.monotonic() + 0.1
+                        else:
+                            time.sleep(0.01)
+                    return buf.decode("utf-8", errors="replace")  # ОДИН раз
+            else:
+                time.sleep(0.02)
+
+        raise TimeoutError(f"ServerQuery не ответил за {timeout} сек")
+
+    def send(self, command: str, timeout: float = 5.0) -> str:
         """Отправить команду и вернуть сырой ответ сервера."""
         assert self._shell is not None, "сначала вызовите connect()"
-        self._shell.send(command.strip() + "\n")
-        return self._read_all(wait=wait)
+        cmd = command.strip()
+        self._shell.send(cmd + "\n")
+        raw = self._read_until_error(timeout=timeout)
+        log.debug("CMD=%r RAW=%r", cmd, raw[:400])
+        return raw
 
-    def query(self, command: str, wait: float = 0.5) -> list[dict[str, str]]:
+    def query(self, command: str, timeout: float = 5.0) -> list[dict[str, str]]:
         """Отправить команду и вернуть распарсенный ответ."""
-        raw = self.send(command, wait=wait)
+        raw = self.send(command, timeout=timeout)
         return parse_response(raw, echo=command.strip())
 
 # --------------------------------------------------------------------------- #
@@ -272,6 +337,11 @@ class Config:
         with path.open(encoding="utf-8") as f:
             data = json.load(f)
 
+        # Пароль можно переопределить переменной окружения.
+        env_password = os.environ.get("TS6_QUERY_PASSWORD")
+        if env_password:
+            data["password"] = env_password
+
         known = {f.name for f in fields(cls)}
         unknown = set(data) - known
         if unknown:
@@ -279,6 +349,24 @@ class Config:
                         ", ".join(sorted(unknown)))
 
         filtered = {k: v for k, v in data.items() if k in known}
+
+        # Валидация типов — иначе ошибка всплывёт где-то в глубине tick().
+        str_fields = ("host", "username", "password", "poke_message")
+        int_fields = (
+            "query_port", "virtual_server_id", "afk_channel_id",
+            "timeout_seconds", "check_interval", "reconnect_delay",
+        )
+        for key in str_fields:
+            if key in filtered and not isinstance(filtered[key], str):
+                raise ValueError(f"config.json: поле '{key}' должно быть строкой")
+        for key in int_fields:
+            if key in filtered and not isinstance(filtered[key], int):
+                raise ValueError(f"config.json: поле '{key}' должно быть целым числом")
+        if "exclude_uids" in filtered and not isinstance(filtered["exclude_uids"], list):
+            raise ValueError("config.json: поле 'exclude_uids' должно быть массивом")
+        if "exclude_channels" in filtered and not isinstance(filtered["exclude_channels"], list):
+            raise ValueError("config.json: поле 'exclude_channels' должно быть массивом")
+
         try:
             return cls(**filtered)
         except TypeError as exc:
@@ -292,17 +380,40 @@ class AFKBot:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.query: Optional[TS6Query] = None
-        self._stop = False
+        self._stop_evt = threading.Event()
 
     # -- сигналы ------------------------------------------------------------ #
 
     def install_signal_handlers(self) -> None:
         def handler(signum, _frame):
-            log.info("Получен сигнал %s — завершаю работу...", signum)
-            self._stop = True
+            if self._stop_evt.is_set():
+                # Повторный Ctrl+C — выходим жёстко, без ожидания.
+                log.warning("Повторный сигнал %s — немедленный выход.", signum)
+                raise KeyboardInterrupt
+            log.info(
+                "Получен сигнал %s — завершаю работу "
+                "(Ctrl+C ещё раз = жёсткий выход)...", signum,
+            )
+            self._stop_evt.set()
 
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
+
+    # -- ожидание с реакцией на сигнал -------------------------------------- #
+
+    def _wait(self, seconds: float) -> None:
+        """
+        Ждать seconds или до получения сигнала остановки.
+
+        Event.wait() в Python 3 перезапускается после сигнала (PEP 475), поэтому
+        ждём короткими кусками — так максимум ~0.5 сек до реакции на Ctrl+C.
+        """
+        end = time.monotonic() + seconds
+        while not self._stop_evt.is_set():
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            self._stop_evt.wait(timeout=min(0.5, remaining))
 
     # -- подключение -------------------------------------------------------- #
 
@@ -312,16 +423,20 @@ class AFKBot:
             port=self.cfg.query_port,
             username=self.cfg.username,
             password=self.cfg.password,
+            stop_evt=self._stop_evt,
         )
         q.connect()
 
-        # Выбираем виртуальный сервер
-        resp = q.query(f"use sid={self.cfg.virtual_server_id}")
-        if not resp:
+        # Выбираем виртуальный сервер. При успехе ответ пустой (только error id=0),
+        # ошибка выбросит RuntimeError внутри query().
+        try:
+            q.query(f"use sid={self.cfg.virtual_server_id}")
             log.info("Выбран виртуальный сервер sid=%d", self.cfg.virtual_server_id)
+        except RuntimeError as exc:
+            raise RuntimeError(f"Не удалось выбрать sid: {exc}") from exc
 
-        # Устанавливаем читаемый ник query-клиента
-        q.send("clientupdate client_nickname=AFK-Bot", wait=0.3)
+        # Читаемый ник query-клиента.
+        q.send(f"clientupdate client_nickname={escape('AFK-Bot')}")
 
         self.query = q
 
@@ -331,62 +446,64 @@ class AFKBot:
         assert self.query is not None
         cfg = self.cfg
 
+        # Одна команда вместо N+1 запросов clientinfo:
+        # -uid даёт unique_identifier, -times — client_idle_time/connected_time.
         try:
-            clients = self.query.query("clientlist -uid", wait=0.8)
+            clients = self.query.query("clientlist -uid -times")
         except RuntimeError as exc:
             log.error("Не удалось получить clientlist: %s", exc)
             raise
 
         moved = 0
         for c in clients:
-            if self._stop:
+            if self._stop_evt.is_set():
                 return
 
-            # Пропускаем query-клиентов (client_type=1)
+            # Пропускаем query-клиентов (client_type=1).
             if c.get("client_type") == "1":
                 continue
 
-            clid = c.get("clid")
-            uid = c.get("client_unique_identifier", "")
+            clid = c.get("clid", "")
             cid = c.get("cid", "")
+            uid = c.get("client_unique_identifier", "")
             nick = c.get("client_nickname", f"clid={clid}")
 
-            if clid is None or cid == "":
+            # Валидация: без неё в команду ServerQuery может утечь мусор.
+            if not clid.isdigit() or not cid.isdigit():
+                log.debug("Пропускаю клиента с некорректным clid/cid: %r", c)
                 continue
 
-            # Уже в AFK-канале — не трогаем
+            # Уже в AFK-канале — не трогаем.
             if cid == str(cfg.afk_channel_id):
                 continue
 
-            # Исключения по каналу
-            if cid.isdigit() and int(cid) in cfg.exclude_channels:
+            if int(cid) in cfg.exclude_channels:
                 continue
 
-            # Исключения по UID
             if uid and uid in cfg.exclude_uids:
                 continue
 
-            # Читаем время простоя
-            try:
-                info = self.query.query(f"clientinfo clid={clid}", wait=0.5)
-            except RuntimeError as exc:
-                log.warning("clientinfo для clid=%s не удался: %s", clid, exc)
-                continue
-
-            # Ищем запись с client_idle_time, а не доверяем info[0]:
-            # в info может попасть эхо команды или промежуточные строки.
-            idle_entry = next(
-                (e for e in info if "client_idle_time" in e),
-                None,
-            )
-            if idle_entry is None:
-                log.debug(
-                    "clientinfo для clid=%s не содержит client_idle_time "
-                    "(получено %d записей)", clid, len(info),
+            # client_idle_time может прийти из -times, но не все сервера
+            # отдают его в clientlist. Тогда падаем обратно на clientinfo.
+            idle_ms_str = c.get("client_idle_time")
+            if idle_ms_str is None:
+                try:
+                    info = self.query.query(f"clientinfo clid={clid}")
+                except RuntimeError as exc:
+                    log.warning("clientinfo для clid=%s не удался: %s", clid, exc)
+                    continue
+                idle_entry = next(
+                    (e for e in info if "client_idle_time" in e),
+                    None,
                 )
-                continue
+                if idle_entry is None:
+                    log.debug(
+                        "clientinfo для clid=%s не содержит client_idle_time "
+                        "(получено %d записей)", clid, len(info),
+                    )
+                    continue
+                idle_ms_str = idle_entry.get("client_idle_time", "0") or "0"
 
-            idle_ms_str = idle_entry.get("client_idle_time", "0") or "0"
             try:
                 idle_ms = int(idle_ms_str)
             except ValueError:
@@ -395,27 +512,25 @@ class AFKBot:
             if idle_ms < cfg.timeout_seconds * 1000:
                 continue
 
-            # Перемещаем
+            safe_nick = sanitize_for_log(nick)
+
+            # Перемещаем.
             try:
-                self.query.query(
-                    f"clientmove clid={clid} cid={cfg.afk_channel_id}",
-                    wait=0.4,
-                )
+                self.query.query(f"clientmove clid={clid} cid={cfg.afk_channel_id}")
                 log.info(
                     "Перемещён в AFK: %s (clid=%s, простой %.1f мин)",
-                    nick, clid, idle_ms / 60000,
+                    safe_nick, clid, idle_ms / 60000,
                 )
                 moved += 1
             except RuntimeError as exc:
                 log.warning("clientmove для clid=%s не удался: %s", clid, exc)
                 continue
 
-            # Опциональное оповещение
+            # Опциональное оповещение.
             if cfg.poke_message:
                 try:
                     self.query.query(
-                        f"clientpoke clid={clid} msg={escape(cfg.poke_message)}",
-                        wait=0.3,
+                        f"clientpoke clid={clid} msg={escape(cfg.poke_message)}"
                     )
                 except RuntimeError as exc:
                     log.debug("clientpoke для clid=%s не удался: %s", clid, exc)
@@ -428,7 +543,7 @@ class AFKBot:
     def run(self) -> None:
         self.install_signal_handlers()
 
-        while not self._stop:
+        while not self._stop_evt.is_set():
             try:
                 self.connect()
                 log.info(
@@ -438,19 +553,21 @@ class AFKBot:
                     self.cfg.check_interval,
                 )
 
-                while not self._stop:
+                while not self._stop_evt.is_set():
                     try:
                         self.tick()
-                    except (SSHException, OSError, EOFError, RuntimeError) as exc:
+                    except StopRequested:
+                        break
+                    except (SSHException, OSError, EOFError,
+                            RuntimeError, TimeoutError) as exc:
                         log.error("Сбой во время проверки: %s", exc)
-                        break  # выходим во внешний цикл для переподключения
+                        break  # переподключение
 
-                    # Спим, но с реакцией на сигнал
-                    slept = 0
-                    while slept < self.cfg.check_interval and not self._stop:
-                        time.sleep(1)
-                        slept += 1
+                    # Короткий polling — Ctrl+C отрабатывает за ≤0.5 сек.
+                    self._wait(self.cfg.check_interval)
 
+            except StopRequested:
+                pass
             except Exception as exc:  # noqa: BLE001
                 log.error("Не удалось подключиться: %s", exc)
             finally:
@@ -458,14 +575,11 @@ class AFKBot:
                     self.query.close()
                     self.query = None
 
-            if self._stop:
+            if self._stop_evt.is_set():
                 break
 
             log.info("Переподключение через %d сек...", self.cfg.reconnect_delay)
-            slept = 0
-            while slept < self.cfg.reconnect_delay and not self._stop:
-                time.sleep(1)
-                slept += 1
+            self._wait(self.cfg.reconnect_delay)
 
         log.info("Бот остановлен.")
 
@@ -492,7 +606,8 @@ def main() -> int:
 
     try:
         cfg = Config.load(Path(args.config))
-    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+    except (FileNotFoundError, ValueError) as exc:
+        # json.JSONDecodeError — подкласс ValueError, отдельно ловить не нужно.
         log.error("Ошибка конфигурации: %s", exc)
         return 1
 
