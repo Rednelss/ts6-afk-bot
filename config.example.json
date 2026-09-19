@@ -1,0 +1,20 @@
+{
+  "host": "ИЗМЕНИ_МЕНЯ",
+  "query_port": 10022,
+  "username": "ИЗМЕНИ_МЕНЯ",
+  "password": "ИЗМЕНИ_МЕНЯ",
+
+  "virtual_server_id": 1,
+  "afk_channel_id": 3,
+
+  "timeout_seconds": 300,
+  "check_interval": 30,
+  "poke_message": "Вы были перемещены в канал AFK из-за неактивности в течении 5 минут.",
+
+  "exclude_uids": [
+    "AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz="
+  ],
+  "exclude_channels": [ 1 ],
+
+  "reconnect_delay": 10
+}
