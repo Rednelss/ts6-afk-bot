@@ -1,0 +1,26 @@
+# Пример systemd-unit для запуска бота на Linux.
+# Скопируйте в /etc/systemd/system/ts6-afk-bot.service
+# и подправьте пути и пользователя.
+#
+# Затем:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ts6-afk-bot
+#   sudo journalctl -u ts6-afk-bot -f
+
+[Unit]
+Description=TeamSpeak 6 AFK Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tsbot
+WorkingDirectory=/opt/ts6-afk-bot
+ExecStart=/opt/ts6-afk-bot/.venv/bin/python /opt/ts6-afk-bot/bot.py --config /opt/ts6-afk-bot/config.json
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
