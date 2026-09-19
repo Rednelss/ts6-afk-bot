@@ -43,10 +43,11 @@ import threading
 import time
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Optional
 
 import paramiko
 from paramiko.ssh_exception import AuthenticationException, SSHException
+
+__version__ = "1.0.0"
 
 # --------------------------------------------------------------------------- #
 #  Логирование
@@ -74,10 +75,10 @@ class StopRequested(Exception):
 # ANSI escape-последовательности, которые возвращает SSH-шелл (TTY).
 _ANSI_RE = re.compile(
     r"\x1b(?:"
-    r"\[[0-9;?]*[A-Za-z]"     # CSI
-    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC (BEL или ST)
-    r"|[()][0-9A-Za-z]"       # charset select
-    r"|[=>MNOP]"              # одиночные escape
+    r"\[[0-9;?]*[A-Za-z]"                 # CSI
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"     # OSC (BEL или ST)
+    r"|[()][0-9A-Za-z]"                   # charset select
+    r"|[=>MNOP]"                          # одиночные escape
     r")"
 )
 
@@ -92,7 +93,7 @@ def unescape(value: str) -> str:
     Раскодировать экранированные символы ServerQuery.
 
     Порядок замен критичен: сначала разворачиваем двойной бэкслеш,
-    иначе последующие replace('\\p', '|') сожрут его хвост.
+    иначе последующие replace('\\\\p', '|') сожрут его хвост.
     """
     return (
         value.replace("\\\\", "\\")
@@ -193,7 +194,7 @@ class TS6Query:
         port: int,
         username: str,
         password: str,
-        stop_evt: Optional[threading.Event] = None,
+        stop_evt: threading.Event | None = None,
         connect_timeout: int = 15,
     ) -> None:
         self.host = host
@@ -202,7 +203,7 @@ class TS6Query:
         self.password = password
         self.connect_timeout = connect_timeout
         self._stop_evt = stop_evt
-        self._ssh: Optional[paramiko.SSHClient] = None
+        self._ssh: paramiko.SSHClient | None = None
         self._shell = None
 
     # -- проверка остановки ------------------------------------------------- #
@@ -236,6 +237,7 @@ class TS6Query:
             raise RuntimeError(f"Ошибка SSH при подключении: {exc}") from exc
 
         self._ssh = ssh
+        # Большие размеры терминала исключают переносы приглашения и пагинацию.
         self._shell = ssh.invoke_shell(term="xterm", width=512, height=512)
         # Считываем приветственный баннер (там нет error id=).
         self._drain(duration=0.8)
@@ -260,27 +262,35 @@ class TS6Query:
     def _drain(self, duration: float = 0.5) -> str:
         """Прочитать всё, что успеет прийти за окно тишины (для баннера)."""
         assert self._shell is not None
-        buf = ""
+        chunks: list[bytes] = []
         deadline = time.monotonic() + duration
         while time.monotonic() < deadline:
             self._check_stop()
             if self._shell.recv_ready():
-                buf += self._shell.recv(65535).decode("utf-8", errors="replace")
+                chunks.append(self._shell.recv(65535))
                 deadline = time.monotonic() + 0.1
             else:
                 time.sleep(0.02)
-        return buf
+        return b"".join(chunks).decode("utf-8", errors="replace")
 
     def _read_until_error(self, timeout: float = 5.0) -> str:
+        """
+        Читать ответ, пока не увидим 'error id='. После этого дочитать хвост
+        (промпт) коротким окном тишины. Проверяет stop_evt на каждом шаге —
+        иначе Ctrl+C не сможет прервать I/O.
+
+        Копим БАЙТЫ, декодируем один раз в конце: иначе многобайтовый UTF-8
+        (ник с эмодзи) может разорваться на границе recv и превратиться в '?'.
+        """
         assert self._shell is not None
-        buf = b""  # байты, не строка
+        buf = b""
         deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
             self._check_stop()
             if self._shell.recv_ready():
                 buf += self._shell.recv(65535)
-                # ищем маркер в байтах — он ASCII, декодировать не нужно
+                # Маркер ASCII — ищем в байтах, декодирование не нужно.
                 if b"error id=" in buf:
                     quiet_until = time.monotonic() + 0.1
                     while time.monotonic() < quiet_until:
@@ -290,7 +300,7 @@ class TS6Query:
                             quiet_until = time.monotonic() + 0.1
                         else:
                             time.sleep(0.01)
-                    return buf.decode("utf-8", errors="replace")  # ОДИН раз
+                    return buf.decode("utf-8", errors="replace")
             else:
                 time.sleep(0.02)
 
@@ -302,7 +312,12 @@ class TS6Query:
         cmd = command.strip()
         self._shell.send(cmd + "\n")
         raw = self._read_until_error(timeout=timeout)
-        log.debug("CMD=%r RAW=%r", cmd, raw[:400])
+        if log.isEnabledFor(logging.DEBUG):
+            if len(raw) > 800:
+                log.debug("CMD=%r RAW[%d]=%r…%r",
+                          cmd, len(raw), raw[:400], raw[-200:])
+            else:
+                log.debug("CMD=%r RAW=%r", cmd, raw)
         return raw
 
     def query(self, command: str, timeout: float = 5.0) -> list[dict[str, str]]:
@@ -379,7 +394,7 @@ class Config:
 class AFKBot:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.query: Optional[TS6Query] = None
+        self.query: TS6Query | None = None
         self._stop_evt = threading.Event()
 
     # -- сигналы ------------------------------------------------------------ #
@@ -427,13 +442,28 @@ class AFKBot:
         )
         q.connect()
 
-        # Выбираем виртуальный сервер. При успехе ответ пустой (только error id=0),
-        # ошибка выбросит RuntimeError внутри query().
+        # Выбираем виртуальный сервер.
         try:
             q.query(f"use sid={self.cfg.virtual_server_id}")
-            log.info("Выбран виртуальный сервер sid=%d", self.cfg.virtual_server_id)
         except RuntimeError as exc:
-            raise RuntimeError(f"Не удалось выбрать sid: {exc}") from exc
+            raise RuntimeError(
+                f"use sid={self.cfg.virtual_server_id} не удался: {exc}"
+            ) from exc
+
+        # Проверяем, что контекст действительно переключился: ServerQuery
+        # иногда возвращает error id=0, но оставляет предыдущий сервер.
+        try:
+            who = q.query("whoami")
+        except RuntimeError as exc:
+            raise RuntimeError(f"whoami не удался: {exc}") from exc
+
+        actual_sid = who[0].get("virtualserver_id") if who else None
+        if actual_sid != str(self.cfg.virtual_server_id):
+            raise RuntimeError(
+                f"use sid={self.cfg.virtual_server_id} не сработал: "
+                f"сервер сообщает virtualserver_id={actual_sid}"
+            )
+        log.info("Выбран виртуальный сервер sid=%d", self.cfg.virtual_server_id)
 
         # Читаемый ник query-клиента.
         q.send(f"clientupdate client_nickname={escape('AFK-Bot')}")
@@ -587,8 +617,11 @@ class AFKBot:
 #  Точка входа
 # --------------------------------------------------------------------------- #
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="TS6 AFK Bot")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ts6-afk-bot",
+        description="TeamSpeak 6 AFK bot: перемещает неактивных в отдельный канал.",
+    )
     parser.add_argument(
         "-c", "--config",
         default="config.json",
@@ -599,7 +632,15 @@ def main() -> int:
         action="store_true",
         help="Подробный вывод (DEBUG)",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "-V", "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -620,6 +661,7 @@ def main() -> int:
         bot.run()
     except KeyboardInterrupt:
         log.info("Прервано пользователем.")
+        return 130  # 128 + SIGINT — стандарт для обёрток вроде systemd
     return 0
 
 if __name__ == "__main__":
