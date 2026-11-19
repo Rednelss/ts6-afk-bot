@@ -1,495 +1,606 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-install.py — автоматическая установка и настройка ts6-afk-bot на Linux.
-
-Что делает скрипт:
-  1. Проверяет права root и наличие Python 3.10+ / git / venv.
-  2. Ставит системные зависимости через родной пакетный менеджер (apt/dnf/yum/pacman/zypper).
-  3. Создаёт изолированного системного пользователя (по умолчанию ts6afkbot).
-  4. Клонирует https://github.com/Rednelss/ts6-afk-bot в /opt/ts6-afk-bot
-     (или берёт локальную копию через --source).
-  5. Создаёт venv и ставит зависимости (paramiko >= 3.4).
-  6. Интерактивно (или через флаги) собирает config.json в /etc/ts6-afk-bot/.
-  7. Пароль ServerQuery кладёт в /etc/ts6-afk-bot/env (chmod 600), а не в JSON.
-  8. Генерирует hardened systemd-юнит, включает и запускает сервис.
-
-Примеры:
-  sudo python3 install.py
-  sudo python3 install.py --host ts.example.com --afk-channel-id 12 --username bot --password 'secret'
-  sudo python3 install.py --non-interactive --host ts.example.com --afk-channel-id 12 --virtual-server-id 1
-  sudo python3 install.py --uninstall --purge
-
-Лицензия: MIT
-"""
+"""Install or remove ts6-afk-bot on Linux. Requires Python 3.10+ and root."""
 
 from __future__ import annotations
 
 import argparse
 import getpass
+import grp
 import json
 import os
+import pwd
 import re
+import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+from dataclasses import asdict
 from pathlib import Path
 
-# --------------------------------------------------------------------------- #
-#                                Константы                                    #
-# --------------------------------------------------------------------------- #
+from configuration import Config
+from i18n import DEFAULT_LANGUAGE, LANGUAGES, configure_cli_language, tr
 
 REPO_URL = "https://github.com/Rednelss/ts6-afk-bot.git"
-
 SERVICE_NAME = "ts6-afk-bot"
 SYSTEM_USER = "ts6afkbot"
-
+SYSTEM_GROUP = SYSTEM_USER
+USER_CREATED = False
 INSTALL_DIR = Path("/opt/ts6-afk-bot")
 CONFIG_DIR = Path("/etc/ts6-afk-bot")
 STATE_DIR = Path("/var/lib/ts6-afk-bot")
-
-DEFAULTS = {
-    "query_port": 10022,
-    "virtual_server_id": 1,
-    "timeout_seconds": 300,
-    "check_interval": 30,
-    "reconnect_delay": 10,
-    "poke_message": "Вы были перемещены в канал AFK из-за неактивности в течении 5 минут.",
-}
-
-# Эти пути пересчитываются в main() при переопределении через CLI
 VENV_DIR = INSTALL_DIR / "venv"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 ENV_FILE = CONFIG_DIR / "env"
 UNIT_FILE = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
+MARKER_NAME = ".ts6-afk-bot-install"
+_MISSING = object()
 
-# --------------------------------------------------------------------------- #
-#                             Вывод в консоль                                 #
-# --------------------------------------------------------------------------- #
+PKG_TABLE = {
+    "apt-get": ["python3", "python3-venv", "python3-pip", "git"],
+    "dnf": ["python3", "python3-pip", "git"],
+    "yum": ["python3", "python3-pip", "git"],
+    "pacman": ["python", "python-pip", "git"],
+    "zypper": ["python3", "python3-pip", "git"],
+}
+
 
 def _use_color() -> bool:
     return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
+
 def _paint(code: str, text: str) -> str:
     return f"\033[{code}m{text}\033[0m" if _use_color() else text
+
 
 def info(msg: str) -> None:
     print(f"{_paint('34', '[*]')} {msg}", flush=True)
 
+
 def ok(msg: str) -> None:
     print(f"{_paint('32', '[+]')} {msg}", flush=True)
+
 
 def warn(msg: str) -> None:
     print(f"{_paint('33', '[!]')} {msg}", flush=True)
 
+
 def err(msg: str) -> None:
     print(f"{_paint('31', '[-]')} {msg}", file=sys.stderr, flush=True)
 
-def die(msg: str, code: int = 1) -> "None":
+
+def die(msg: str, code: int = 1) -> None:
     err(msg)
-    sys.exit(code)
+    raise SystemExit(code)
 
-# --------------------------------------------------------------------------- #
-#                          Обёртка над subprocess                             #
-# --------------------------------------------------------------------------- #
 
-def run(cmd, check: bool = True, capture: bool = False, cwd=None,
-        env=None, quiet: bool = False, input_text: str | None = None):
-    """Запустить команду. cmd — список аргументов (shell не используется)."""
-    display = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+def run(
+    cmd: list[str],
+    check: bool = True,
+    capture: bool = False,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    quiet: bool = False,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if isinstance(cmd, str):
+        raise TypeError(tr("Commands must be passed as an argument list, not a shell string."))
+    command = [str(part) for part in cmd]
+    display = shlex.join(command)
     if not quiet:
         info(f"$ {display}")
-
-    result = subprocess.run(
-        cmd,
-        shell=isinstance(cmd, str),
-        check=False,
-        cwd=cwd,
-        env=env,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.STDOUT if capture else None,
-        text=True,
-        input=input_text,
-    )
-
-    if check and result.returncode != 0:
+    try:
+        result = subprocess.run(
+            command,
+            shell=False,
+            check=False,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.STDOUT if capture else None,
+            text=True,
+            input=input_text,
+        )
+    except OSError as exc:
+        die(tr("Could not run {command}: {error}", command=display, error=exc))
+    if check and result.returncode:
         if capture and result.stdout:
             err(result.stdout.strip())
-        die(f"Команда завершилась с кодом {result.returncode}: {display}")
-
+        die(
+            tr(
+                "Command exited with code {code}: {command}",
+                code=result.returncode,
+                command=display,
+            )
+        )
     return result
 
-# --------------------------------------------------------------------------- #
-#                            Базовые проверки                                 #
-# --------------------------------------------------------------------------- #
 
 def ensure_root() -> None:
     if os.geteuid() != 0:
-        die("Скрипт нужно запускать от root:\n    sudo python3 install.py")
+        die(tr("Run this installer as root:\n    sudo python3 install.py"))
+
 
 def check_python() -> None:
     if not shutil.which("python3"):
-        die("python3 не найден. Установите Python 3.10+ и повторите запуск.")
-
-    res = run(
+        die(tr("python3 was not found. Install Python 3.10+ and try again."))
+    result = run(
         ["python3", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
-        capture=True, quiet=True, check=False,
+        capture=True,
+        quiet=True,
+        check=False,
     )
-    if res.returncode != 0:
-        die("Не удалось определить версию Python.")
-
-    version = res.stdout.strip()
+    if result.returncode:
+        die(tr("Could not determine the Python version."))
+    version = result.stdout.strip()
     try:
-        major, minor = (int(x) for x in version.split("."))
+        major, minor = (int(part) for part in version.split("."))
     except ValueError:
-        die(f"Не удалось разобрать версию Python: {version!r}")
-
+        die(tr("Could not parse the Python version: {version!r}", version=version))
     if (major, minor) < (3, 10):
-        die(f"Требуется Python 3.10+, найден {version}.")
-
+        die(tr("Python 3.10+ is required; found {version}.", version=version))
     ok(f"Python {version}")
+    result = run(["python3", "-c", "import venv"], capture=True, quiet=True, check=False)
+    if result.returncode:
+        die(tr("The venv module is unavailable. Install python3-venv on Debian/Ubuntu."))
 
-    venv_check = run(["python3", "-c", "import venv"], capture=True, quiet=True, check=False)
-    if venv_check.returncode != 0:
-        die("Модуль 'venv' недоступен. Установите пакет python3-venv (Debian/Ubuntu).")
-
-# --------------------------------------------------------------------------- #
-#                        Системные зависимости                                #
-# --------------------------------------------------------------------------- #
-
-PKG_TABLE = {
-    "apt-get": ["python3", "python3-venv", "python3-pip", "git"],
-    "dnf":     ["python3", "python3-pip", "git"],
-    "yum":     ["python3", "python3-pip", "git"],
-    "pacman":  ["python", "python-pip", "git"],
-    "zypper":  ["python3", "python3-pip", "git"],
-}
 
 def detect_package_manager() -> str | None:
-    for pm in ("apt-get", "dnf", "yum", "pacman", "zypper"):
-        if shutil.which(pm):
-            return pm
-    return None
+    return next((name for name in PKG_TABLE if shutil.which(name)), None)
+
 
 def install_system_dependencies() -> None:
-    pm = detect_package_manager()
-
-    if pm is None:
-        warn("Пакетный менеджер не определён — установку зависимостей пропускаю.")
+    manager = detect_package_manager()
+    if manager is None:
+        warn(tr("No supported package manager found; skipping system packages."))
         return
+    info(tr("Package manager: {manager}", manager=manager))
+    packages = PKG_TABLE[manager]
+    if manager == "apt-get":
+        run(["apt-get", "update", "-qq"], check=False, quiet=True)
+        command = ["apt-get", "install", "-y", "--no-install-recommends", *packages]
+    elif manager in ("dnf", "yum"):
+        command = [manager, "install", "-y", *packages]
+    elif manager == "pacman":
+        # Do not refresh the package database without a full system upgrade.
+        command = ["pacman", "-S", "--noconfirm", "--needed", *packages]
+    else:
+        command = ["zypper", "--non-interactive", "install", *packages]
+    if run(command, check=False).returncode:
+        warn(tr("System package installation failed; checking available tools next."))
 
-    info(f"Пакетный менеджер: {pm}")
-    packages = PKG_TABLE.get(pm, [])
-
-    try:
-        if pm == "apt-get":
-            run(["apt-get", "update", "-qq"], check=False, quiet=True)
-            run(["apt-get", "install", "-y", "--no-install-recommends", *packages], check=False)
-        elif pm in ("dnf", "yum"):
-            run([pm, "install", "-y", *packages], check=False)
-        elif pm == "pacman":
-            run(["pacman", "-Sy", "--noconfirm", "--needed", *packages], check=False)
-        elif pm == "zypper":
-            run(["zypper", "--non-interactive", "install", *packages], check=False)
-    except Exception as exc:  # noqa: BLE001 — не валим установку из-за пакетов
-        warn(f"Не удалось установить часть пакетов: {exc}")
-
-# --------------------------------------------------------------------------- #
-#                       Системный пользователь                                #
-# --------------------------------------------------------------------------- #
 
 def ensure_system_user() -> None:
-    import pwd  # локальный импорт: модуль есть только на Unix
-
+    global SYSTEM_GROUP, USER_CREATED
+    USER_CREATED = False
     try:
-        pwd.getpwnam(SYSTEM_USER)
-        ok(f"Пользователь '{SYSTEM_USER}' уже существует")
+        account = pwd.getpwnam(SYSTEM_USER)
+        ok(tr("User '{user}' already exists.", user=SYSTEM_USER))
+        try:
+            marker = json.loads((INSTALL_DIR / MARKER_NAME).read_text(encoding="utf-8"))
+            USER_CREATED = (
+                isinstance(marker, dict)
+                and marker.get("service") == SERVICE_NAME
+                and marker.get("user") == SYSTEM_USER
+                and marker.get("created_user") is True
+            )
+        except (OSError, ValueError):
+            pass
     except KeyError:
-        shell = "/usr/sbin/nologin"
-        if not Path(shell).exists():
-            shell = "/bin/false"
-        info(f"Создаю системного пользователя '{SYSTEM_USER}'...")
-        run([
-            "useradd", "--system",
-            "--home-dir", str(STATE_DIR),
-            "--no-create-home",
-            "--shell", shell,
-            SYSTEM_USER,
-        ], check=False)
-
+        shell = "/usr/sbin/nologin" if Path("/usr/sbin/nologin").exists() else "/bin/false"
+        info(tr("Creating system user '{user}'...", user=SYSTEM_USER))
+        run(
+            [
+                "useradd",
+                "--system",
+                "--user-group",
+                "--home-dir",
+                str(STATE_DIR),
+                "--no-create-home",
+                "--shell",
+                shell,
+                SYSTEM_USER,
+            ]
+        )
+        USER_CREATED = True
+        account = pwd.getpwnam(SYSTEM_USER)
+    if account.pw_uid == 0:
+        die(tr("The bot must not run as a user with UID 0."))
+    SYSTEM_GROUP = grp.getgrgid(account.pw_gid).gr_name
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    run(["chown", "-R", f"{SYSTEM_USER}:{SYSTEM_USER}", str(STATE_DIR)], check=False, quiet=True)
-    run(["chmod", "750", str(STATE_DIR)], check=False, quiet=True)
+    os.chown(STATE_DIR, account.pw_uid, account.pw_gid)
+    os.chmod(STATE_DIR, 0o750)
 
-# --------------------------------------------------------------------------- #
-#                        Получение исходников                                #
-# --------------------------------------------------------------------------- #
 
 def fetch_source(source: str | None, skip_update: bool) -> None:
     bot_file = INSTALL_DIR / "bot.py"
-
-    if bot_file.exists():
-        if skip_update:
-            ok("Исходники уже на месте, обновление пропущено (--skip-update)")
-            return
-        if (INSTALL_DIR / ".git").exists():
-            info("Обновляю репозиторий...")
-            run(["git", "-C", str(INSTALL_DIR), "fetch", "--depth", "1", "origin"], check=False)
-            run(["git", "-C", str(INSTALL_DIR), "reset", "--hard", "FETCH_HEAD"], check=False)
-            ok("Репозиторий обновлён")
-        else:
-            ok("Исходники уже на месте (не git-репозиторий) — обновление пропущено")
+    if bot_file.is_file() and skip_update:
+        ok(tr("Source update skipped (--skip-update)."))
         return
 
-    if INSTALL_DIR.exists() and any(INSTALL_DIR.iterdir()):
-        die(f"Каталог {INSTALL_DIR} существует и не пуст, но не содержит bot.py.\n"
-            f"    Удалите его вручную или укажите другой путь через --install-dir.")
-
-    INSTALL_DIR.parent.mkdir(parents=True, exist_ok=True)
-
-    if source and Path(source).expanduser().exists():
-        local = Path(source).expanduser().resolve()
-        info(f"Копирую локальные исходники из {local}")
-        shutil.copytree(local, INSTALL_DIR, dirs_exist_ok=True)
+    local = Path(source).expanduser() if source else None
+    if local is not None and local.exists():
+        local = local.resolve()
+        if not local.is_dir():
+            die(tr("Local source must be a directory: {path}", path=local))
+        if local == INSTALL_DIR.resolve():
+            if not bot_file.is_file():
+                die(tr("Source file not found: {path}", path=bot_file))
+            return
+        if INSTALL_DIR.resolve().is_relative_to(local):
+            die(tr("The installation directory must be outside the source directory."))
+        if INSTALL_DIR.exists() and not bot_file.is_file() and any(INSTALL_DIR.iterdir()):
+            die(
+                tr(
+                    "Directory {path} is not empty and does not contain bot.py. Choose another --install-dir.",
+                    path=INSTALL_DIR,
+                )
+            )
+        if not (local / "bot.py").is_file():
+            die(tr("Source file not found: {path}", path=local / "bot.py"))
+        info(tr("Copying local sources from {path}", path=local))
+        shutil.copytree(
+            local,
+            INSTALL_DIR,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns(
+                ".git",
+                ".venv",
+                "venv",
+                "__pycache__",
+                ".ruff_cache",
+                ".pytest_cache",
+                ".aws",
+                ".codex",
+                ".agents",
+                "config.json",
+                "env",
+                ".env",
+                MARKER_NAME,
+            ),
+        )
+    elif bot_file.is_file():
+        if (INSTALL_DIR / ".git").exists():
+            if source:
+                origin = run(
+                    ["git", "-C", str(INSTALL_DIR), "remote", "get-url", "origin"],
+                    capture=True,
+                    quiet=True,
+                ).stdout.strip()
+                if origin.rstrip("/") != source.rstrip("/"):
+                    die(
+                        tr(
+                            "The installed repository has a different origin. Use its checkout or choose another --install-dir."
+                        )
+                    )
+            info(tr("Updating the repository..."))
+            # A failed fetch must not reset to a stale FETCH_HEAD or discard local changes.
+            run(["git", "-C", str(INSTALL_DIR), "pull", "--ff-only"])
+            ok(tr("Repository updated."))
+        else:
+            if source:
+                die(
+                    tr(
+                        "The installed sources are not a Git checkout. Choose another --install-dir for a source URL."
+                    )
+                )
+            ok(tr("Installed sources are not a Git repository; update skipped."))
+        return
     else:
+        if INSTALL_DIR.exists() and any(INSTALL_DIR.iterdir()):
+            die(
+                tr(
+                    "Directory {path} is not empty and does not contain bot.py. Choose another --install-dir.",
+                    path=INSTALL_DIR,
+                )
+            )
+        if not shutil.which("git"):
+            die(tr("git was not found. Install it before using a source URL."))
+        INSTALL_DIR.parent.mkdir(parents=True, exist_ok=True)
         url = source or REPO_URL
-        info(f"Клонирую {url}")
-        run(["git", "clone", "--depth", "1", url, str(INSTALL_DIR)])
+        info(tr("Cloning {url}", url=url))
+        run(["git", "clone", "--depth", "1", "--", url, str(INSTALL_DIR)])
+    if not bot_file.is_file():
+        die(tr("Source file not found: {path}", path=bot_file))
 
-    if not bot_file.exists():
-        die(f"После получения исходников файл {bot_file} не найден. "
-            f"Проверьте содержимое репозитория.")
-
-# --------------------------------------------------------------------------- #
-#                              venv + pip                                     #
-# --------------------------------------------------------------------------- #
 
 def setup_venv() -> None:
-    pip = VENV_DIR / "bin" / "pip"
     py = VENV_DIR / "bin" / "python"
-
-    if not py.exists():
-        info("Создаю виртуальное окружение...")
+    if not py.is_file():
+        info(tr("Creating a virtual environment..."))
         run(["python3", "-m", "venv", str(VENV_DIR)])
-
-    run([str(pip), "install", "--upgrade", "pip", "wheel"], check=False, quiet=True)
-
+    run([str(py), "-m", "pip", "install", "--upgrade", "pip", "wheel"], check=False, quiet=True)
     requirements = INSTALL_DIR / "requirements.txt"
-    if requirements.exists():
-        run([str(pip), "install", "-r", str(requirements)])
+    if requirements.is_file():
+        run([str(py), "-m", "pip", "install", "-r", str(requirements)])
     else:
-        warn("requirements.txt не найден — ставлю paramiko напрямую")
-        run([str(pip), "install", "paramiko>=3.4"])
+        warn(tr("requirements.txt was not found; installing paramiko directly."))
+        run([str(py), "-m", "pip", "install", "paramiko>=3.4"])
+    result = run(
+        [str(py), "-c", "import paramiko; print(paramiko.__version__)"],
+        capture=True,
+        quiet=True,
+        check=False,
+    )
+    if result.returncode:
+        die(tr("paramiko was not installed. Check the pip output above."))
+    ok(f"paramiko {result.stdout.strip()}")
 
-    check = run([str(py), "-c", "import paramiko; print(paramiko.__version__)"],
-                capture=True, quiet=True, check=False)
-    if check.returncode != 0:
-        die("paramiko не установился в venv. Проверьте вывод pip выше.")
-    ok(f"paramiko {check.stdout.strip()}")
-
-# --------------------------------------------------------------------------- #
-#                        Интерактивный ввод                                   #
-# --------------------------------------------------------------------------- #
 
 def ask(prompt: str, default=None, required: bool = True, cast=str, validator=None):
-    suffix = f" [{default}]" if default not in (None, "") else ""
+    suffix = f" [{default}]" if default not in (None, "", []) else ""
     while True:
         try:
             raw = input(f"{prompt}{suffix}: ").strip()
         except EOFError:
-            raw = ""
-
-        if raw == "":
+            die(
+                tr(
+                    "Input ended before configuration was complete. Use --non-interactive with the required options."
+                )
+            )
+        if not raw:
             if default is not None:
-                raw = str(default)
+                raw = default
             elif not required:
                 return None
             else:
-                print("  Значение обязательно.")
+                print("  " + tr("A value is required."))
                 continue
-
         try:
             value = cast(raw)
         except (TypeError, ValueError):
-            print("  Некорректное значение, попробуйте снова.")
+            print("  " + tr("Invalid value; try again."))
             continue
-
-        if validator and not validator(value):
-            print("  Некорректное значение, попробуйте снова.")
+        if validator is not None and not validator(value):
+            print("  " + tr("Invalid value; try again."))
             continue
-
         return value
 
-def parse_int_list(value) -> list:
+
+def parse_int_list(value) -> list[int]:
     if value in (None, "", []):
         return []
-    if isinstance(value, (list, tuple)):
-        return [int(v) for v in value]
-    return [int(x) for x in re.split(r"[,\s]+", str(value).strip()) if x]
+    tokens = value if isinstance(value, (list, tuple)) else re.split(r"[,\s]+", str(value).strip())
+    if any(isinstance(token, bool) for token in tokens):
+        raise ValueError
+    return [int(token) for token in tokens if str(token).strip()]
 
-def parse_str_list(value) -> list:
+
+def parse_str_list(value) -> list[str]:
     if value in (None, "", []):
         return []
-    if isinstance(value, (list, tuple)):
-        return [str(v).strip() for v in value if str(v).strip()]
-    return [x for x in re.split(r"[,\s]+", str(value).strip()) if x]
+    tokens = value if isinstance(value, (list, tuple)) else re.split(r"[,\s]+", str(value).strip())
+    return [str(token).strip() for token in tokens if str(token).strip()]
 
-def build_config(args) -> dict:
+
+def build_config(args: argparse.Namespace) -> dict:
     interactive = not args.non_interactive
 
-    def need(attr, prompt, default=None, cast=str, validator=None, required=True):
-        raw = getattr(args, attr, None)
-        if raw not in (None, "", []):
+    def need(attr, prompt, default=_MISSING, cast=str, validator=None):
+        value = getattr(args, attr, None)
+        if value is not None:
             try:
-                return cast(raw) if cast is not str else raw
+                value = cast(value)
             except (TypeError, ValueError):
-                die(f"Некорректное значение --{attr.replace('_', '-')}: {raw!r}")
-        if not interactive:
-            if not required and default is not None:
-                return default
-            die(f"В неинтерактивном режиме обязательно указать --{attr.replace('_', '-')}")
-        return ask(prompt, default=default, required=required, cast=cast, validator=validator)
+                die(
+                    tr(
+                        "Invalid value for --{option}: {value!r}",
+                        option=attr.replace("_", "-"),
+                        value=value,
+                    )
+                )
+            if validator is not None and not validator(value):
+                die(
+                    tr(
+                        "Invalid value for --{option}: {value!r}",
+                        option=attr.replace("_", "-"),
+                        value=value,
+                    )
+                )
+            return value
+        if interactive:
+            return ask(
+                tr(prompt),
+                default=None if default is _MISSING else default,
+                required=default is _MISSING,
+                cast=cast,
+                validator=validator,
+            )
+        if default is not _MISSING:
+            return default
+        die(tr("--{option} is required in non-interactive mode.", option=attr.replace("_", "-")))
 
-    print()
-    info("Настройка бота. Enter — принять значение по умолчанию.")
-    print()
+    if interactive:
+        print()
+        info(tr("Bot configuration. Press Enter to accept the default."))
+        print()
+    data = {
+        "host": need(
+            "host", "TS6 server address (host)", validator=lambda value: bool(value.strip())
+        ),
+        "query_port": need(
+            "query_port", "SSH ServerQuery port", 10022, int, lambda value: 1 <= value <= 65535
+        ),
+        "username": need(
+            "username",
+            "Query account username",
+            "serveradmin",
+            validator=lambda value: bool(value.strip()),
+        ),
+        "virtual_server_id": need(
+            "virtual_server_id", "Virtual server ID (sid)", 1, int, lambda value: value >= 1
+        ),
+        "afk_channel_id": need(
+            "afk_channel_id", "AFK channel ID (cid)", cast=int, validator=lambda value: value >= 1
+        ),
+        "timeout_seconds": need(
+            "timeout_seconds", "Idle limit in seconds", 300, int, lambda value: value >= 10
+        ),
+        "check_interval": need(
+            "check_interval", "Check interval in seconds", 30, int, lambda value: value >= 1
+        ),
+        "reconnect_delay": need(
+            "reconnect_delay", "Reconnect delay in seconds", 10, int, lambda value: value >= 0
+        ),
+        "poke_message": need(
+            "poke_message", "Poke message (Enter: automatic; '-' to disable)", None
+        ),
+        "exclude_uids": need(
+            "exclude_uids", "Excluded UIDs (comma-separated; empty for none)", [], parse_str_list
+        ),
+        "exclude_channels": need(
+            "exclude_channels",
+            "Excluded channel IDs (comma-separated; empty for none)",
+            [],
+            parse_int_list,
+            lambda value: all(cid >= 1 for cid in value),
+        ),
+        "language": getattr(args, "language", None) or DEFAULT_LANGUAGE,
+    }
+    if interactive and args.poke_message is None and data["poke_message"] == "-":
+        data["poke_message"] = ""
 
-    host = need("host", "Адрес TS6-сервера (host)",
-                validator=lambda v: bool(str(v).strip()))
-    query_port = need("query_port", "Порт SSH ServerQuery",
-                      default=DEFAULTS["query_port"], cast=int,
-                      validator=lambda v: 1 <= v <= 65535)
-    username = need("username", "Логин query-аккаунта", default="serveradmin")
-    virtual_server_id = need("virtual_server_id", "ID виртуального сервера (sid)",
-                             default=DEFAULTS["virtual_server_id"], cast=int,
-                             validator=lambda v: v >= 1)
-    afk_channel_id = need("afk_channel_id", "ID AFK-канала (cid)", cast=int,
-                          validator=lambda v: v >= 1)
-    timeout_seconds = need("timeout_seconds", "Порог простоя, сек",
-                           default=DEFAULTS["timeout_seconds"], cast=int,
-                           validator=lambda v: v > 0)
-    check_interval = need("check_interval", "Период опроса, сек",
-                          default=DEFAULTS["check_interval"], cast=int,
-                          validator=lambda v: v > 0)
-    reconnect_delay = need("reconnect_delay", "Пауза перед переподключением, сек",
-                           default=DEFAULTS["reconnect_delay"], cast=int,
-                           validator=lambda v: v >= 0)
-    poke_message = need("poke_message", "Текст poke-сообщения (пусто — не отправлять)",
-                        default=DEFAULTS["poke_message"], required=False)
-    exclude_uids = need("exclude_uids", "Исключённые UID (через запятую, пусто — нет)",
-                        default="", cast=parse_str_list, required=False)
-    exclude_channels = need("exclude_channels", "Исключённые cid (через запятую, пусто — нет)",
-                            default="", cast=parse_int_list, required=False)
-
-    # --- пароль ------------------------------------------------------------
     password = args.password
     if password is None:
-        if interactive:
-            print()
-            while True:
-                try:
-                    p1 = getpass.getpass("Пароль query-аккаунта (Enter — оставить пустым): ")
-                except (EOFError, KeyboardInterrupt):
-                    p1 = ""
-                if not p1:
+        password = os.environ.get("TS6_QUERY_PASSWORD")
+    if password is None and interactive:
+        while True:
+            try:
+                first = getpass.getpass(tr("Query account password (Enter to leave empty): "))
+                if not first:
                     password = ""
                     break
-                try:
-                    p2 = getpass.getpass("Повторите пароль: ")
-                except (EOFError, KeyboardInterrupt):
-                    p2 = ""
-                if p1 == p2:
-                    password = p1
-                    break
-                warn("Пароли не совпадают, попробуйте снова.")
-        else:
-            password = ""
+                second = getpass.getpass(tr("Repeat the password: "))
+            except EOFError:
+                die(
+                    tr(
+                        "Input ended before configuration was complete. Use --non-interactive with the required options."
+                    )
+                )
+            if first == second:
+                password = first
+                break
+            warn(tr("Passwords do not match; try again."))
+    data["password"] = password if password is not None else ""
+    try:
+        cfg = Config(**data)
+        if cfg.password:
+            quote_environment_value(cfg.password)
+    except ValueError as exc:
+        die(str(exc))
+    return asdict(cfg)
 
-    return {
-        "host": host,
-        "query_port": query_port,
-        "username": username,
-        "password": password,
-        "virtual_server_id": virtual_server_id,
-        "afk_channel_id": afk_channel_id,
-        "timeout_seconds": timeout_seconds,
-        "check_interval": check_interval,
-        "reconnect_delay": reconnect_delay,
-        "poke_message": poke_message or "",
-        "exclude_uids": exclude_uids or [],
-        "exclude_channels": exclude_channels or [],
-    }
-
-# --------------------------------------------------------------------------- #
-#                        Запись конфигов и юнита                              #
-# --------------------------------------------------------------------------- #
 
 def check_connection(host: str, port: int) -> bool:
     try:
         with socket.create_connection((host, port), timeout=5):
-            ok(f"{host}:{port} доступен")
+            ok(tr("{host}:{port} is reachable.", host=host, port=port))
             return True
     except OSError as exc:
-        warn(f"Не удалось подключиться к {host}:{port} ({exc}). "
-             f"Бот переподключится сам, когда сервер станет доступен.")
+        warn(
+            tr(
+                "Could not connect to {host}:{port} ({error}). The bot will retry when the server becomes available.",
+                host=host,
+                port=port,
+                error=exc,
+            )
+        )
         return False
+
+
+def atomic_write(path: Path, content: str, mode: int) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            os.fchmod(handle.fileno(), mode)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
 
 def write_config(cfg: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-
-    data = {
-        "host": cfg["host"],
-        "query_port": cfg["query_port"],
-        "username": cfg["username"],
-        # Пароль НЕ пишем в JSON — он передаётся через переменную окружения.
-        "password": "",
-        "virtual_server_id": cfg["virtual_server_id"],
-        "afk_channel_id": cfg["afk_channel_id"],
-        "timeout_seconds": cfg["timeout_seconds"],
-        "check_interval": cfg["check_interval"],
-        "reconnect_delay": cfg["reconnect_delay"],
-        "poke_message": cfg["poke_message"],
-        "exclude_uids": cfg["exclude_uids"],
-        "exclude_channels": cfg["exclude_channels"],
-    }
-
-    CONFIG_FILE.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.chmod(CONFIG_FILE, 0o640)
     os.chmod(CONFIG_DIR, 0o750)
-    ok(f"Конфиг записан: {CONFIG_FILE}")
+    data = dict(cfg)
+    data["password"] = ""
+    atomic_write(CONFIG_FILE, json.dumps(data, indent=2, ensure_ascii=False) + "\n", 0o640)
+    ok(tr("Configuration written: {path}", path=CONFIG_FILE))
+
+
+def quote_environment_value(value: str) -> str:
+    if any(
+        ord(char) in (0, 0xFEFF)
+        or 0xD800 <= ord(char) <= 0xDFFF
+        or 0xFDD0 <= ord(char) <= 0xFDEF
+        or ord(char) & 0xFFFF in (0xFFFE, 0xFFFF)
+        for char in value
+    ):
+        raise ValueError(
+            tr(
+                "The password contains characters that cannot be stored in a systemd environment file."
+            )
+        )
+    # EnvironmentFile uses shell double-quote escapes, not JSON escape sequences.
+    escaped = value.translate(
+        str.maketrans(
+            {
+                "\\": "\\\\",
+                '"': '\\"',
+                "$": "\\$",
+                chr(96): "\\" + chr(96),
+            }
+        )
+    )
+    return f'"{escaped}"'
+
 
 def write_env(password: str) -> None:
     if not password:
         if ENV_FILE.exists():
             ENV_FILE.unlink()
-            warn(f"Пустой пароль — удалил {ENV_FILE}. "
-                 f"Если нужен пароль, задайте его в config.json или в {ENV_FILE}.")
+            warn(tr("Empty password; removed {path}.", path=ENV_FILE))
         else:
-            info("Пароль не задан — файл окружения не создаётся")
+            info(tr("No password supplied; no environment file created."))
         return
-
     content = (
-        "# Создано install.py. Не добавляйте этот файл в систему контроля версий.\n"
-        "# Переменная переопределяет поле \"password\" в config.json.\n"
-        f"TS6_QUERY_PASSWORD={json.dumps(password, ensure_ascii=False)}\n"
+        "# Generated by install.py. Keep this file out of version control.\n"
+        "# Overrides the password field in config.json.\n"
+        f"TS6_QUERY_PASSWORD={quote_environment_value(password)}\n"
     )
-    ENV_FILE.write_text(content, encoding="utf-8")
-    os.chmod(ENV_FILE, 0o600)
-    ok(f"Пароль сохранён в {ENV_FILE} (chmod 600)")
+    atomic_write(ENV_FILE, content, 0o600)
+    ok(tr("Password saved to {path} (mode 600).", path=ENV_FILE))
+
+
+def unit_quote(value: str, command: bool = False) -> str:
+    value = value.replace("%", "%%")
+    if command:
+        value = value.replace("$", "$$")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
 
 def write_unit(verbose: bool) -> None:
-    exec_line = f"{VENV_DIR}/bin/python {INSTALL_DIR}/bot.py --config {CONFIG_FILE}"
+    command = [
+        str(VENV_DIR / "bin" / "python"),
+        str(INSTALL_DIR / "bot.py"),
+        "--config",
+        str(CONFIG_FILE),
+    ]
     if verbose:
-        exec_line += " --verbose"
-
-    unit = f"""# Сгенерировано install.py — правьте осторожно.
+        command.append("--verbose")
+    # systemd expands environment variables in arguments, but not the executable path.
+    exec_line = (
+        unit_quote(command[0])
+        + " "
+        + " ".join(unit_quote(part, command=True) for part in command[1:])
+    )
+    unit = f"""# Generated by install.py.
 [Unit]
-Description=TeamSpeak 6 AFK Bot
+Description={tr("TeamSpeak 6 AFK bot")}
 Documentation=https://github.com/Rednelss/ts6-afk-bot
 After=network-online.target
 Wants=network-online.target
@@ -497,19 +608,17 @@ Wants=network-online.target
 [Service]
 Type=simple
 User={SYSTEM_USER}
-Group={SYSTEM_USER}
-WorkingDirectory={INSTALL_DIR}
+Group={SYSTEM_GROUP}
+WorkingDirectory={str(INSTALL_DIR).replace("%", "%%")}
 Environment=PYTHONUNBUFFERED=1
-Environment=HOME={STATE_DIR}
-EnvironmentFile=-{ENV_FILE}
+Environment={unit_quote("HOME=" + str(STATE_DIR))}
+EnvironmentFile=-{str(ENV_FILE).replace("%", "%%")}
 ExecStart={exec_line}
 Restart=always
 RestartSec=10
 TimeoutStopSec=10
 KillSignal=SIGTERM
 SyslogIdentifier={SERVICE_NAME}
-
-# --- Hardening ---
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -526,213 +635,379 @@ AmbientCapabilities=
 [Install]
 WantedBy=multi-user.target
 """
-    UNIT_FILE.write_text(unit, encoding="utf-8")
-    os.chmod(UNIT_FILE, 0o644)
-    ok(f"systemd-юнит записан: {UNIT_FILE}")
+    atomic_write(UNIT_FILE, unit, 0o644)
+    ok(tr("systemd unit written: {path}", path=UNIT_FILE))
+
 
 def fix_permissions() -> None:
-    subprocess.run(["chown", "-R", f"root:{SYSTEM_USER}", str(INSTALL_DIR)], check=False)
-    subprocess.run(["chmod", "-R", "g+rX", str(INSTALL_DIR)], check=False)
-    subprocess.run(["chown", "-R", f"root:{SYSTEM_USER}", str(CONFIG_DIR)], check=False)
-    subprocess.run(["chmod", "750", str(CONFIG_DIR)], check=False)
-    if CONFIG_FILE.exists():
-        subprocess.run(["chmod", "640", str(CONFIG_FILE)], check=False)
+    run(["chown", "-R", f"root:{SYSTEM_GROUP}", "--", str(INSTALL_DIR)], quiet=True)
+    run(["chmod", "-R", "g+rX", "--", str(INSTALL_DIR)], quiet=True)
+    run(["chmod", "-R", "go-w", "--", str(INSTALL_DIR)], quiet=True)
+    run(["chown", "-R", f"root:{SYSTEM_GROUP}", "--", str(CONFIG_DIR)], quiet=True)
+    os.chmod(CONFIG_DIR, 0o750)
+    os.chmod(CONFIG_FILE, 0o640)
     if ENV_FILE.exists():
-        subprocess.run(["chown", "root:root", str(ENV_FILE)], check=False)
-        subprocess.run(["chmod", "600", str(ENV_FILE)], check=False)
+        run(["chown", "root:root", "--", str(ENV_FILE)], quiet=True)
+        os.chmod(ENV_FILE, 0o600)
 
-# --------------------------------------------------------------------------- #
-#                          Управление сервисом                                #
-# --------------------------------------------------------------------------- #
 
 def enable_service() -> None:
     if not shutil.which("systemctl"):
-        warn("systemctl не найден (контейнер/WSL?). Сервис не будет запущен.")
-        return
-
+        die(tr("systemctl was not found. Use --no-service for a manual installation."))
     run(["systemctl", "daemon-reload"])
-    run(["systemctl", "enable", "--now", SERVICE_NAME])
-
+    run(["systemctl", "enable", SERVICE_NAME])
+    # enable --now leaves an already running service on the old code and config.
+    run(["systemctl", "restart", SERVICE_NAME])
     time.sleep(2)
-    status = run(["systemctl", "is-active", SERVICE_NAME], capture=True, quiet=True, check=False)
-    state = status.stdout.strip()
-
+    result = run(["systemctl", "is-active", SERVICE_NAME], capture=True, quiet=True, check=False)
+    state = result.stdout.strip()
     if state == "active":
-        ok(f"Сервис {SERVICE_NAME} запущен и активен")
+        ok(tr("Service {service} is active.", service=SERVICE_NAME))
     else:
-        warn(f"Состояние сервиса: {state}. Смотрите логи:")
+        warn(tr("Service state: {state}. Check the logs:", state=state))
         warn(f"  journalctl -u {SERVICE_NAME} -n 50 --no-pager")
-
     run(["systemctl", "status", SERVICE_NAME, "--no-pager", "-l"], check=False)
 
+
+def configure_paths(args: argparse.Namespace) -> None:
+    global INSTALL_DIR, VENV_DIR, CONFIG_DIR, CONFIG_FILE, STATE_DIR, ENV_FILE
+    global UNIT_FILE, SERVICE_NAME, SYSTEM_USER, SYSTEM_GROUP
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,31}", args.user) or args.user == "root":
+        die(tr("Invalid system user name: {user!r}", user=args.user))
+    if not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.@-]*", args.service_name
+    ) or args.service_name.endswith(".service"):
+        die(tr("Invalid service name: {service!r}", service=args.service_name))
+    if any(ord(char) < 32 or ord(char) == 127 for char in args.install_dir):
+        die(tr("Installation paths must not contain control characters."))
+    path = Path(args.install_dir).expanduser().resolve()
+    if str(path) != str(path).rstrip():
+        die(tr("The installation directory must not end with whitespace."))
+    protected = {
+        Path("/"),
+        Path("/opt"),
+        Path("/etc"),
+        Path("/etc/systemd"),
+        Path("/etc/systemd/system"),
+        Path("/usr"),
+        Path("/usr/local"),
+        Path("/var"),
+        Path("/var/lib"),
+        Path("/var/log"),
+        Path("/var/cache"),
+        Path("/home"),
+        Path("/root"),
+        Path("/tmp"),
+        Path("/run"),
+        Path("/dev"),
+        Path("/proc"),
+        Path("/sys"),
+        Path.home(),
+    }
+    if path in protected or any(
+        path.is_relative_to(root) for root in (Path("/dev"), Path("/proc"), Path("/sys"))
+    ):
+        die(tr("Unsafe installation directory: {path}", path=path))
+    INSTALL_DIR = path
+    VENV_DIR = path / "venv"
+    SERVICE_NAME = args.service_name
+    SYSTEM_USER = args.user
+    SYSTEM_GROUP = SYSTEM_USER
+    CONFIG_DIR = Path("/etc") / SERVICE_NAME
+    CONFIG_FILE = CONFIG_DIR / "config.json"
+    ENV_FILE = CONFIG_DIR / "env"
+    STATE_DIR = Path("/var/lib") / SERVICE_NAME
+    UNIT_FILE = Path("/etc/systemd/system") / f"{SERVICE_NAME}.service"
+    managed = (INSTALL_DIR, CONFIG_DIR, STATE_DIR)
+    for index, first in enumerate(managed):
+        for second in managed[index + 1 :]:
+            if first.is_relative_to(second) or second.is_relative_to(first):
+                die(tr("Installation, configuration, and state directories must not overlap."))
+
+
+def check_directories() -> None:
+    for path, hint in (
+        (INSTALL_DIR, INSTALL_DIR / "bot.py"),
+        (CONFIG_DIR, CONFIG_FILE),
+        (STATE_DIR, None),
+    ):
+        if path.is_symlink():
+            die(tr("Installation directories must not be symbolic links: {path}", path=path))
+        if not path.exists() or not any(path.iterdir()) or (path / MARKER_NAME).is_file():
+            continue
+        legacy = hint is not None and hint.is_file()
+        if path == Path("/var/lib/ts6-afk-bot"):
+            legacy = True
+        if not legacy:
+            die(tr("Directory {path} is not managed by this installer.", path=path))
+    check_unit_owner()
+
+
+def check_unit_owner() -> None:
+    if UNIT_FILE.exists():
+        content = UNIT_FILE.read_text(encoding="utf-8")
+        if (
+            "Description=TeamSpeak 6 AFK Bot" not in content
+            and "Documentation=https://github.com/Rednelss/ts6-afk-bot" not in content
+        ):
+            die(tr("The existing unit does not belong to ts6-afk-bot: {path}", path=UNIT_FILE))
+
+
+def write_markers() -> None:
+    content = (
+        json.dumps({"service": SERVICE_NAME, "user": SYSTEM_USER, "created_user": USER_CREATED})
+        + "\n"
+    )
+    for path in (INSTALL_DIR, CONFIG_DIR, STATE_DIR):
+        atomic_write(path / MARKER_NAME, content, 0o640)
+
+
 def uninstall(purge: bool) -> None:
-    info("Удаление ts6-afk-bot...")
-
-    if shutil.which("systemctl") and UNIT_FILE.exists():
-        run(["systemctl", "disable", "--now", SERVICE_NAME], check=False)
-        UNIT_FILE.unlink(missing_ok=True)
-        run(["systemctl", "daemon-reload"], check=False)
+    check_unit_owner()
+    created_user = False
+    if purge:
+        for path in (INSTALL_DIR, CONFIG_DIR, STATE_DIR):
+            if not path.exists():
+                continue
+            try:
+                marker = json.loads((path / MARKER_NAME).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                marker = None
+            if (
+                not isinstance(marker, dict)
+                or marker.get("service") != SERVICE_NAME
+                or marker.get("user") != SYSTEM_USER
+            ):
+                die(
+                    tr(
+                        "Refusing to purge a directory without an installation marker: {path}",
+                        path=path,
+                    )
+                )
+            if path == INSTALL_DIR:
+                created_user = marker.get("created_user") is True
+    info(tr("Uninstalling ts6-afk-bot..."))
+    if UNIT_FILE.exists():
+        if not shutil.which("systemctl"):
+            die(tr("systemctl was not found. Use --no-service for a manual installation."))
+        run(["systemctl", "disable", "--now", SERVICE_NAME])
+        UNIT_FILE.unlink()
+        run(["systemctl", "daemon-reload"])
         run(["systemctl", "reset-failed", SERVICE_NAME], check=False)
-        ok("Сервис остановлен и удалён")
-
+        ok(tr("Service stopped and removed."))
     if purge:
         for path in (INSTALL_DIR, CONFIG_DIR, STATE_DIR):
             if path.exists():
-                shutil.rmtree(path, ignore_errors=True)
-                ok(f"Удалено: {path}")
-        run(["userdel", SYSTEM_USER], check=False)
-        ok(f"Пользователь {SYSTEM_USER} удалён (если существовал)")
+                shutil.rmtree(path)
+                ok(tr("Removed: {path}", path=path))
+        if created_user:
+            try:
+                pwd.getpwnam(SYSTEM_USER)
+            except KeyError:
+                pass
+            else:
+                run(["userdel", SYSTEM_USER])
+                ok(tr("User {user} removed.", user=SYSTEM_USER))
+        else:
+            info(tr("Existing user {user} retained.", user=SYSTEM_USER))
     else:
-        warn(f"Данные сохранены: {INSTALL_DIR}, {CONFIG_DIR}, {STATE_DIR}")
-        warn("Для полного удаления запустите: sudo python3 install.py --uninstall --purge")
+        warn(
+            tr(
+                "Data kept: {install}, {config}, {state}",
+                install=INSTALL_DIR,
+                config=CONFIG_DIR,
+                state=STATE_DIR,
+            )
+        )
+        warn(tr("To remove the data too, repeat the same options with --uninstall --purge."))
+    ok(tr("Done."))
 
-    ok("Готово.")
 
-# --------------------------------------------------------------------------- #
-#                                  main                                       #
-# --------------------------------------------------------------------------- #
-
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        configure_cli_language(argv)
+    except ValueError as exc:
+        die(str(exc))
     parser = argparse.ArgumentParser(
         prog="install.py",
-        description="Установщик ts6-afk-bot (TeamSpeak 6 AFK Bot) для Linux.",
+        allow_abbrev=False,
+        description=tr("Linux installer for ts6-afk-bot (TeamSpeak 6 AFK bot)."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Примеры:\n"
-            "  sudo python3 install.py\n"
-            "  sudo python3 install.py --host ts.example.com --afk-channel-id 12\n"
-            "  sudo python3 install.py --non-interactive --host ts.example.com "
-            "--afk-channel-id 12 --username bot --password secret\n"
-            "  sudo python3 install.py --uninstall --purge\n"
-        ),
+        epilog=tr("Examples:") + "\n"
+        "  sudo python3 install.py\n"
+        "  sudo python3 install.py --language ru\n"
+        "  sudo python3 install.py --non-interactive --host ts.example.com --afk-channel-id 12\n"
+        "  sudo python3 install.py --uninstall --purge\n",
+    )
+    group = parser.add_argument_group(
+        tr("Bot options (prompted for unless --non-interactive is set)")
+    )
+    group.add_argument(
+        "--language",
+        choices=LANGUAGES,
+        help=tr("Interface and bot language (default: en; or TS6_LANGUAGE)"),
+    )
+    group.add_argument("--host", help=tr("TS6 server address"))
+    group.add_argument("--query-port", type=int, help=tr("SSH ServerQuery port (default: 10022)"))
+    group.add_argument("--username", help=tr("Query account username"))
+    group.add_argument(
+        "--password", help=tr("Query account password (or TS6_QUERY_PASSWORD; saved outside JSON)")
+    )
+    group.add_argument("--virtual-server-id", type=int, help=tr("Virtual server ID (sid)"))
+    group.add_argument("--afk-channel-id", type=int, help=tr("AFK channel ID (cid)"))
+    group.add_argument("--timeout-seconds", type=int, help=tr("Idle limit in seconds"))
+    group.add_argument("--check-interval", type=int, help=tr("Check interval in seconds"))
+    group.add_argument("--reconnect-delay", type=int, help=tr("Reconnect delay in seconds"))
+    group.add_argument(
+        "--poke-message", help=tr("Custom poke text; an empty string disables pokes")
+    )
+    group.add_argument("--exclude-uids", help=tr("Comma-separated client UIDs to exclude"))
+    group.add_argument("--exclude-channels", help=tr("Comma-separated channel IDs to exclude"))
+
+    group = parser.add_argument_group(tr("Installation options"))
+    group.add_argument(
+        "--source",
+        default=str(Path(__file__).resolve().parent),
+        help=tr("Source URL or local directory (default: this checkout)"),
+    )
+    group.add_argument(
+        "--install-dir",
+        default="/opt/ts6-afk-bot",
+        help=tr("Installation directory (default: /opt/ts6-afk-bot)"),
+    )
+    group.add_argument("--user", default="ts6afkbot", help=tr("System user (default: ts6afkbot)"))
+    group.add_argument(
+        "--service-name",
+        default="ts6-afk-bot",
+        help=tr("systemd service name, without .service (default: ts6-afk-bot)"),
+    )
+    group.add_argument("--skip-update", action="store_true", help=tr("Keep the installed sources"))
+    group.add_argument(
+        "--no-service", action="store_true", help=tr("Install without creating a systemd service")
+    )
+    group.add_argument(
+        "--bot-verbose", action="store_true", help=tr("Run the bot with debug logging")
+    )
+    group.add_argument(
+        "--non-interactive",
+        "--yes",
+        dest="non_interactive",
+        action="store_true",
+        help=tr("Use defaults without prompting; --host and --afk-channel-id are required"),
     )
 
-    # --- конфигурация бота ---
-    g = parser.add_argument_group("Параметры бота (иначе спросит интерактивно)")
-    g.add_argument("--host", help="Адрес TS6-сервера")
-    g.add_argument("--query-port", dest="query_port", type=int,
-                   help=f"Порт SSH ServerQuery (по умолчанию {DEFAULTS['query_port']})")
-    g.add_argument("--username", help="Логин query-аккаунта")
-    g.add_argument("--password", help="Пароль query-аккаунта (попадёт в /etc/ts6-afk-bot/env)")
-    g.add_argument("--virtual-server-id", dest="virtual_server_id", type=int,
-                   help="ID виртуального сервера (sid)")
-    g.add_argument("--afk-channel-id", dest="afk_channel_id", type=int,
-                   help="ID AFK-канала (cid)")
-    g.add_argument("--timeout-seconds", dest="timeout_seconds", type=int,
-                   help="Порог простоя в секундах")
-    g.add_argument("--check-interval", dest="check_interval", type=int,
-                   help="Период опроса в секундах")
-    g.add_argument("--reconnect-delay", dest="reconnect_delay", type=int,
-                   help="Пауза перед переподключением в секундах")
-    g.add_argument("--poke-message", dest="poke_message",
-                   help="Текст poke-сообщения (пусто — не отправлять)")
-    g.add_argument("--exclude-uids", dest="exclude_uids",
-                   help="UID через запятую, которых не трогать")
-    g.add_argument("--exclude-channels", dest="exclude_channels",
-                   help="cid каналов через запятую, где не трогать")
+    group = parser.add_argument_group(tr("Uninstallation"))
+    group.add_argument("--uninstall", action="store_true", help=tr("Stop and remove the service"))
+    group.add_argument(
+        "--purge",
+        action="store_true",
+        help=tr("With --uninstall: also remove installed files and the system user"),
+    )
+    args = parser.parse_args(argv)
+    if args.purge and not args.uninstall:
+        parser.error(tr("--purge requires --uninstall."))
+    if args.language is None:
+        args.language = os.environ.get("TS6_LANGUAGE", DEFAULT_LANGUAGE)
+    return args
 
-    # --- установка ---
-    g2 = parser.add_argument_group("Параметры установки")
-    g2.add_argument("--source", default=None,
-                    help="URL или локальный путь к исходникам вместо GitHub")
-    g2.add_argument("--install-dir", default=str(INSTALL_DIR),
-                    help=f"Каталог установки (по умолчанию {INSTALL_DIR})")
-    g2.add_argument("--user", default=SYSTEM_USER,
-                    help=f"Системный пользователь (по умолчанию {SYSTEM_USER})")
-    g2.add_argument("--service-name", default=SERVICE_NAME,
-                    help=f"Имя systemd-юнита (по умолчанию {SERVICE_NAME})")
-    g2.add_argument("--skip-update", action="store_true",
-                    help="Не обновлять исходники, если они уже есть")
-    g2.add_argument("--no-service", action="store_true",
-                    help="Установить без создания systemd-юнита")
-    g2.add_argument("--bot-verbose", action="store_true",
-                    help="Запускать бота с флагом --verbose")
-    g2.add_argument("--non-interactive", "--yes", dest="non_interactive",
-                    action="store_true",
-                    help="Не задавать вопросов (все значения должны быть в флагах)")
 
-    # --- удаление ---
-    g3 = parser.add_argument_group("Удаление")
-    g3.add_argument("--uninstall", action="store_true", help="Удалить бота и сервис")
-    g3.add_argument("--purge", action="store_true",
-                    help="Вместе с --uninstall: удалить также все данные и пользователя")
-
-    return parser.parse_args()
-
-def main() -> None:
-    global INSTALL_DIR, VENV_DIR, CONFIG_FILE, ENV_FILE, UNIT_FILE, SERVICE_NAME, SYSTEM_USER
-
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    configure_paths(args)
     ensure_root()
-
-    # --- применяем CLI-переопределения путей -------------------------------
-    INSTALL_DIR = Path(args.install_dir).expanduser()
-    VENV_DIR = INSTALL_DIR / "venv"
-    SERVICE_NAME = args.service_name
-    SYSTEM_USER = args.user
-    UNIT_FILE = Path(f"/etc/systemd/system/{SERVICE_NAME}.service")
-
     if args.uninstall:
         uninstall(args.purge)
         return
-
     print()
-    print(_paint("1;34", "  TS6 AFK Bot — установщик для Linux"))
-    print(_paint("90", f"  каталог: {INSTALL_DIR}   сервис: {SERVICE_NAME}.service"))
+    print(_paint("1;34", "  " + tr("TS6 AFK Bot: Linux installer")))
+    print(
+        _paint(
+            "90",
+            "  "
+            + tr(
+                "directory: {path}   service: {service}.service",
+                path=INSTALL_DIR,
+                service=SERVICE_NAME,
+            ),
+        )
+    )
     print()
-
-    install_system_dependencies()
-    check_python()
-
-    if not shutil.which("git"):
-        die("git не найден. Установите его вручную и повторите запуск.")
 
     cfg = build_config(args)
-
-    print()
+    check_directories()
+    if not args.no_service and not shutil.which("systemctl"):
+        die(tr("systemctl was not found. Use --no-service for a manual installation."))
+    install_system_dependencies()
+    check_python()
     ensure_system_user()
     fetch_source(args.source, args.skip_update)
     setup_venv()
-
     check_connection(cfg["host"], cfg["query_port"])
-
     write_config(cfg)
-    write_env(cfg["password"])
+    if (
+        args.non_interactive
+        and args.password is None
+        and "TS6_QUERY_PASSWORD" not in os.environ
+        and ENV_FILE.exists()
+    ):
+        info(tr("No password supplied; keeping the existing environment file."))
+    else:
+        write_env(cfg["password"])
+    write_markers()
     fix_permissions()
-
     if args.no_service:
-        warn("Флаг --no-service: systemd-юнит не создан.")
+        warn(tr("--no-service: no systemd unit created."))
         print()
-        info("Ручной запуск:")
-        print(f"    sudo -u {SYSTEM_USER} {VENV_DIR}/bin/python "
-              f"{INSTALL_DIR}/bot.py --config {CONFIG_FILE}")
+        info(tr("Manual start:"))
+        if ENV_FILE.exists():
+            info(
+                tr(
+                    "Set TS6_QUERY_PASSWORD in your shell before starting the bot; sudo must preserve it."
+                )
+            )
+        command = ["sudo"]
+        if ENV_FILE.exists():
+            command.append("--preserve-env=TS6_QUERY_PASSWORD")
+        command += [
+            "-u",
+            SYSTEM_USER,
+            str(VENV_DIR / "bin" / "python"),
+            str(INSTALL_DIR / "bot.py"),
+            "--config",
+            str(CONFIG_FILE),
+        ]
+        print("    " + shlex.join(command))
         print()
         return
 
     write_unit(args.bot_verbose)
     enable_service()
-
     print()
-    ok("Установка завершена.")
+    ok(tr("Installation complete."))
     print()
-    print(_paint("1", "  Полезные команды:"))
+    print(_paint("1", "  " + tr("Useful commands:")))
     print(f"    systemctl status {SERVICE_NAME}")
     print(f"    systemctl restart {SERVICE_NAME}")
     print(f"    journalctl -u {SERVICE_NAME} -f")
     print()
-    print(_paint("1", "  Файлы:"))
-    print(f"    конфиг : {CONFIG_FILE}")
+    print(_paint("1", "  " + tr("Files:")))
+    print("    " + tr("config: {path}", path=CONFIG_FILE))
     if ENV_FILE.exists():
-        print(f"    пароль : {ENV_FILE}")
-    print(f"    код    : {INSTALL_DIR}")
+        print("    " + tr("password: {path}", path=ENV_FILE))
+    print("    " + tr("code: {path}", path=INSTALL_DIR))
     print()
-    warn("После правки config.json выполните: "
-         f"sudo systemctl restart {SERVICE_NAME}")
+    warn(
+        tr("After editing config.json, run: sudo systemctl restart {service}", service=SERVICE_NAME)
+    )
     print()
+
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
         print()
-        die("Прервано пользователем.", code=130)
+        die(tr("Interrupted by the user."), code=130)
+    except (OSError, ValueError) as exc:
+        die(tr("Installation failed: {error}", error=exc))

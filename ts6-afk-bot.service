@@ -1,26 +1,39 @@
-# Пример systemd-unit для запуска бота на Linux.
-# Скопируйте в /etc/systemd/system/ts6-afk-bot.service
-# и подправьте пути и пользователя.
-#
-# Затем:
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now ts6-afk-bot
-#   sudo journalctl -u ts6-afk-bot -f
+# Example for a manually provisioned installation; create the account and directories first.
+# Set the language in /etc/ts6-afk-bot/config.json, then restart this service.
 
 [Unit]
 Description=TeamSpeak 6 AFK Bot
+Documentation=https://github.com/Rednelss/ts6-afk-bot
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=tsbot
+User=ts6afkbot
+Group=ts6afkbot
 WorkingDirectory=/opt/ts6-afk-bot
-ExecStart=/opt/ts6-afk-bot/.venv/bin/python /opt/ts6-afk-bot/bot.py --config /opt/ts6-afk-bot/config.json
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/var/lib/ts6-afk-bot
+EnvironmentFile=-/etc/ts6-afk-bot/env
+ExecStart=/opt/ts6-afk-bot/venv/bin/python /opt/ts6-afk-bot/bot.py --config /etc/ts6-afk-bot/config.json
 Restart=always
 RestartSec=10
+TimeoutStopSec=10
+KillSignal=SIGTERM
 StandardOutput=journal
 StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target

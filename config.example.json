@@ -1,21 +1,19 @@
 {
-  "host": "ИЗМЕНИ_МЕНЯ",
+  "host": "CHANGE_ME",
   "query_port": 10022,
-  "username": "ИЗМЕНИ_МЕНЯ",
-  "password": "ИЗМЕНИ_МЕНЯ",
+  "username": "CHANGE_ME",
+  "password": "",
 
   "virtual_server_id": 1,
   "afk_channel_id": 3,
+  "language": "en",
 
   "timeout_seconds": 300,
   "check_interval": 30,
-  "poke_message": "Вы были перемещены в канал AFK из-за неактивности в течении 5 минут.",
+  "poke_message": null,
 
-  "exclude_uids": [
-    "AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz=",
-    "zZyYxXwWvVuUtTsSrRqQpPoOnNmMlLkKjJiIhHgGfFeEdDcCbBaA="
-  ],
-  "exclude_channels": [ 1, 99 ],
+  "exclude_uids": [],
+  "exclude_channels": [],
 
   "reconnect_delay": 10
 }

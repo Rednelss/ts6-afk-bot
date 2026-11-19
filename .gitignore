@@ -1,0 +1,9 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+config.json
+env
+.env
+.ts6-afk-bot-install
